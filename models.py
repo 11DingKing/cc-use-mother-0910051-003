@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, DateTime, ForeignKey, Text, Float, Enum as SAEnum, Boolean
+from sqlalchemy import Column, Integer, String, Date, DateTime, ForeignKey, Text, Float, Enum as SAEnum, Boolean, Table
 from sqlalchemy.orm import relationship
 from datetime import datetime, date
 from database import Base
@@ -31,6 +31,42 @@ class EnrollmentStatus(str, enum.Enum):
     ENROLLED = "已入班"
     DROPPED = "已退班"
     COMPLETED = "已完成培训"
+
+
+class AbsenceReason(str, enum.Enum):
+    PERSONAL = "事假"
+    SICK = "病假"
+    SCHOOL_ACTIVITY = "学校活动"
+    OTHER = "其他"
+
+
+class ApprovalDecision(str, enum.Enum):
+    PENDING = "待审批"
+    SUBSTITUTE = "批准替代课程"
+    MAKEUP = "批准补训考核"
+    REJECTED = "不予批准"
+
+
+class RequirementStatus(str, enum.Enum):
+    REQUIRED = "必修"
+    OPTIONAL = "选修"
+
+
+class EvidenceType(str, enum.Enum):
+    ATTENDANCE = "原课出勤"
+    SUBSTITUTE = "替代课程"
+    MAKEUP_EXAM = "补训考核"
+
+
+class EvidenceStatus(str, enum.Enum):
+    ACTIVE = "有效"
+    REVOKED = "已撤销"
+
+
+class ReviewStatus(str, enum.Enum):
+    PENDING = "待复核"
+    CONFIRMED = "复核维持"
+    REVISED = "复核改判"
 
 
 class TimeSlotStatus(str, enum.Enum):
@@ -122,6 +158,7 @@ class Volunteer(Base):
     points_records = relationship("PointsRecord", back_populates="volunteer")
     benefit_exchanges = relationship("BenefitExchange", back_populates="volunteer")
     star_certificates = relationship("StarCertificate", back_populates="volunteer")
+    competency_evidences = relationship("CompetencyEvidence", back_populates="volunteer")
 
 
 class AssessmentTopic(Base):
@@ -159,6 +196,8 @@ class TrainingBatch(Base):
     sessions = relationship("TrainingSession", back_populates="batch", cascade="all, delete-orphan")
     enrollments = relationship("Enrollment", back_populates="batch", cascade="all, delete-orphan")
     assessments = relationship("Assessment", back_populates="training_batch")
+    rule_versions = relationship("BatchRuleVersion", back_populates="batch")
+    requirements = relationship("BatchRequirement", back_populates="batch")
 
 
 class TrainingSession(Base):
@@ -194,6 +233,7 @@ class Enrollment(Base):
     volunteer = relationship("Volunteer", back_populates="enrollments")
     batch = relationship("TrainingBatch", back_populates="enrollments")
     attendances = relationship("SessionAttendance", back_populates="enrollment", cascade="all, delete-orphan")
+    absences = relationship("AbsenceRecord", back_populates="enrollment")
 
 
 class SessionAttendance(Base):
@@ -330,6 +370,7 @@ class Assessment(Base):
     parent_assessment = relationship("Assessment", remote_side=[id])
     scores = relationship("AssessmentScore", back_populates="assessment", cascade="all, delete-orphan")
     certification = relationship("VolunteerCertification", back_populates="assessment", uselist=False)
+    evidence_basis = relationship("AssessmentEvidenceBasis", back_populates="assessment")
 
 
 class TimeSlot(Base):
@@ -437,3 +478,144 @@ class StarCertificate(Base):
 
     volunteer = relationship("Volunteer", back_populates="star_certificates")
     star_level = relationship("StarLevel")
+
+
+# ==================== 培训证据组合（必修能力依据） ====================
+
+# 必修能力要求 ↔ 原课次（一项要求可对应多节课，一节课也可支撑多项要求）
+batch_requirement_sessions = Table(
+    "batch_requirement_sessions",
+    Base.metadata,
+    Column("requirement_id", Integer, ForeignKey("batch_requirements.id"), primary_key=True),
+    Column("session_id", Integer, ForeignKey("training_sessions.id"), primary_key=True),
+)
+
+
+class BatchRuleVersion(Base):
+    """课程规则版本：改版生成新版本，旧版本及其要求、证据组合永久保留、不被重算。"""
+    __tablename__ = "batch_rule_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(Integer, ForeignKey("training_batches.id"), nullable=False)
+    version_no = Column(Integer, nullable=False)
+    change_summary = Column(Text)
+    published_by = Column(String(50))
+    published_at = Column(DateTime, default=datetime.utcnow)
+    is_current = Column(Boolean, default=True)
+
+    batch = relationship("TrainingBatch", back_populates="rule_versions")
+    requirements = relationship("BatchRequirement", back_populates="rule_version")
+
+
+class BatchRequirement(Base):
+    """期次必修能力要求（规则版本下的快照行，发布后不可改，改版另建新行）。"""
+    __tablename__ = "batch_requirements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(Integer, ForeignKey("training_batches.id"), nullable=False)
+    rule_version_id = Column(Integer, ForeignKey("batch_rule_versions.id"))
+    code = Column(String(30), nullable=False)
+    name = Column(String(100), nullable=False)
+    requirement_status = Column(SAEnum(RequirementStatus), default=RequirementStatus.REQUIRED)
+    description = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    batch = relationship("TrainingBatch", back_populates="requirements")
+    rule_version = relationship("BatchRuleVersion", back_populates="requirements")
+    sessions = relationship("TrainingSession", secondary=batch_requirement_sessions)
+    evidences = relationship("CompetencyEvidence", back_populates="requirement")
+
+
+class AbsenceRecord(Base):
+    """缺课登记与审批：缺课原因、批准的替代方式都在此留痕。"""
+    __tablename__ = "absence_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    enrollment_id = Column(Integer, ForeignKey("enrollments.id"), nullable=False)
+    session_id = Column(Integer, ForeignKey("training_sessions.id"), nullable=False)
+    volunteer_id = Column(Integer, ForeignKey("volunteers.id"), nullable=False)
+    reason = Column(SAEnum(AbsenceReason), nullable=False)
+    reason_detail = Column(Text)
+    evidence_note = Column(Text)
+    reported_at = Column(DateTime, default=datetime.utcnow)
+    decision = Column(SAEnum(ApprovalDecision), default=ApprovalDecision.PENDING)
+    decided_by = Column(String(50))
+    decided_at = Column(DateTime)
+    decision_comment = Column(Text)
+    substitute_session_id = Column(Integer, ForeignKey("training_sessions.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    enrollment = relationship("Enrollment", back_populates="absences")
+    session = relationship("TrainingSession", foreign_keys=[session_id])
+    substitute_session = relationship("TrainingSession", foreign_keys=[substitute_session_id])
+    evidences = relationship("CompetencyEvidence", back_populates="absence")
+
+
+class CompetencyEvidence(Base):
+    """
+    必修能力证据组合：每项必修要求可由 原课出勤 / 批准的替代课程 / 补训考核 之一满足。
+    撤销只改状态不删行；撤销后依赖它的考核、证书进入复核（见 EvidenceReview）。
+    """
+    __tablename__ = "competency_evidences"
+
+    id = Column(Integer, primary_key=True, index=True)
+    requirement_id = Column(Integer, ForeignKey("batch_requirements.id"), nullable=False)
+    volunteer_id = Column(Integer, ForeignKey("volunteers.id"), nullable=False)
+    enrollment_id = Column(Integer, ForeignKey("enrollments.id"))
+    evidence_type = Column(SAEnum(EvidenceType), nullable=False)
+    status = Column(SAEnum(EvidenceStatus), default=EvidenceStatus.ACTIVE)
+    attendance_id = Column(Integer, ForeignKey("session_attendances.id"))
+    substitute_session_id = Column(Integer, ForeignKey("training_sessions.id"))
+    assessment_id = Column(Integer, ForeignKey("assessments.id"))
+    absence_id = Column(Integer, ForeignKey("absence_records.id"))
+    note = Column(Text)
+    created_by = Column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    revoked_at = Column(DateTime)
+    revoked_by = Column(String(50))
+    revoke_reason = Column(Text)
+
+    requirement = relationship("BatchRequirement", back_populates="evidences")
+    volunteer = relationship("Volunteer", back_populates="competency_evidences")
+    enrollment = relationship("Enrollment")
+    attendance = relationship("SessionAttendance")
+    substitute_session = relationship("TrainingSession", foreign_keys=[substitute_session_id])
+    assessment = relationship("Assessment", foreign_keys=[assessment_id])
+    absence = relationship("AbsenceRecord", back_populates="evidences")
+    basis_rows = relationship("AssessmentEvidenceBasis", back_populates="evidence")
+
+
+class AssessmentEvidenceBasis(Base):
+    """考核形成时的证据快照：考核依据了哪些有效证据，历史依据不随后续规则改版重算。"""
+    __tablename__ = "assessment_evidence_basis"
+
+    id = Column(Integer, primary_key=True, index=True)
+    assessment_id = Column(Integer, ForeignKey("assessments.id"), nullable=False)
+    evidence_id = Column(Integer, ForeignKey("competency_evidences.id"), nullable=False)
+    requirement_id = Column(Integer, ForeignKey("batch_requirements.id"), nullable=False)
+    evidence_type = Column(SAEnum(EvidenceType), nullable=False)
+    snapshot_at = Column(DateTime, default=datetime.utcnow)
+
+    assessment = relationship("Assessment", back_populates="evidence_basis")
+    evidence = relationship("CompetencyEvidence", back_populates="basis_rows")
+    requirement = relationship("BatchRequirement")
+
+
+class EvidenceReview(Base):
+    """证据撤销引发的复核任务：关联考核/证书进入待复核，成绩与证书记录不删除。"""
+    __tablename__ = "evidence_reviews"
+
+    id = Column(Integer, primary_key=True, index=True)
+    evidence_id = Column(Integer, ForeignKey("competency_evidences.id"), nullable=False)
+    assessment_id = Column(Integer, ForeignKey("assessments.id"))
+    certification_id = Column(Integer, ForeignKey("volunteer_certifications.id"))
+    reason = Column(Text)
+    status = Column(SAEnum(ReviewStatus), default=ReviewStatus.PENDING)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    handled_by = Column(String(50))
+    handled_at = Column(DateTime)
+    handle_comment = Column(Text)
+
+    evidence = relationship("CompetencyEvidence")
+    assessment = relationship("Assessment", foreign_keys=[assessment_id])
+    certification = relationship("VolunteerCertification", foreign_keys=[certification_id])

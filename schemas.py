@@ -3,7 +3,8 @@ from datetime import date, datetime
 from typing import Optional, List
 from models import (
     VolunteerStatus, AssessmentResult, TimeSlotStatus, TrainingBatchStatus, EnrollmentStatus,
-    PointsType, PointsSource, BenefitType, ExchangeStatus
+    PointsType, PointsSource, BenefitType, ExchangeStatus,
+    AbsenceReason, ApprovalDecision, RequirementStatus, EvidenceType, EvidenceStatus, ReviewStatus
 )
 
 
@@ -800,6 +801,212 @@ class BenefitStats(BaseModel):
     total_points: int
 
 
+# ==================== 培训证据组合（必修能力依据） ====================
+
+class BatchRuleVersionBase(BaseModel):
+    change_summary: Optional[str] = None
+    published_by: Optional[str] = None
+
+
+class BatchRuleVersionCreate(BatchRuleVersionBase):
+    pass
+
+
+class BatchRuleVersion(BaseModel):
+    id: int
+    batch_id: int
+    version_no: int
+    change_summary: Optional[str] = None
+    published_by: Optional[str] = None
+    published_at: datetime
+    is_current: bool
+
+    class Config:
+        from_attributes = True
+
+
+class BatchRequirementBase(BaseModel):
+    code: str
+    name: str
+    requirement_status: RequirementStatus = RequirementStatus.REQUIRED
+    description: Optional[str] = None
+    session_ids: List[int] = []
+
+
+class BatchRequirementCreate(BatchRequirementBase):
+    pass
+
+
+class BatchRuleVersionPublish(BatchRuleVersionBase):
+    requirements: List[BatchRequirementBase] = []
+
+
+class BatchRequirementUpdate(BaseModel):
+    name: Optional[str] = None
+    requirement_status: Optional[RequirementStatus] = None
+    description: Optional[str] = None
+    session_ids: Optional[List[int]] = None
+
+
+class BatchRequirement(BaseModel):
+    id: int
+    batch_id: int
+    rule_version_id: Optional[int] = None
+    code: str
+    name: str
+    requirement_status: RequirementStatus
+    description: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class BatchRequirementDetail(BatchRequirement):
+    rule_version: Optional[BatchRuleVersion] = None
+    session_ids: List[int] = []
+
+
+class AbsenceCreate(BaseModel):
+    enrollment_id: int
+    session_id: int
+    reason: AbsenceReason
+    reason_detail: Optional[str] = None
+    evidence_note: Optional[str] = None
+
+
+class AbsenceDecisionUpdate(BaseModel):
+    decision: ApprovalDecision
+    decided_by: Optional[str] = None
+    decision_comment: Optional[str] = None
+    substitute_session_id: Optional[int] = None
+
+
+class AbsenceRecord(BaseModel):
+    id: int
+    enrollment_id: int
+    session_id: int
+    volunteer_id: int
+    reason: AbsenceReason
+    reason_detail: Optional[str] = None
+    evidence_note: Optional[str] = None
+    reported_at: datetime
+    decision: ApprovalDecision
+    decided_by: Optional[str] = None
+    decided_at: Optional[datetime] = None
+    decision_comment: Optional[str] = None
+    substitute_session_id: Optional[int] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AbsenceRecordDetail(AbsenceRecord):
+    session: Optional[TrainingSession] = None
+    substitute_session: Optional[TrainingSession] = None
+
+
+class CompetencyEvidenceCreate(BaseModel):
+    requirement_id: int
+    volunteer_id: int
+    evidence_type: EvidenceType
+    enrollment_id: Optional[int] = None
+    attendance_id: Optional[int] = None
+    substitute_session_id: Optional[int] = None
+    assessment_id: Optional[int] = None
+    absence_id: Optional[int] = None
+    note: Optional[str] = None
+    created_by: Optional[str] = None
+
+
+class CompetencyEvidence(BaseModel):
+    id: int
+    requirement_id: int
+    volunteer_id: int
+    enrollment_id: Optional[int] = None
+    evidence_type: EvidenceType
+    status: EvidenceStatus
+    attendance_id: Optional[int] = None
+    substitute_session_id: Optional[int] = None
+    assessment_id: Optional[int] = None
+    absence_id: Optional[int] = None
+    note: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: datetime
+    revoked_at: Optional[datetime] = None
+    revoked_by: Optional[str] = None
+    revoke_reason: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CompetencyEvidenceDetail(CompetencyEvidence):
+    requirement: Optional[BatchRequirement] = None
+    substitute_session: Optional[TrainingSession] = None
+    assessment: Optional["Assessment"] = None
+
+
+class RequirementEvidenceStatus(BaseModel):
+    """某人的一项必修要求的满足情况。"""
+    requirement_id: int
+    code: str
+    name: str
+    requirement_status: RequirementStatus
+    satisfied: bool
+    has_makeup_approval: bool = False
+    active_evidences: List[CompetencyEvidence] = []
+
+
+class EligibilityGap(BaseModel):
+    """某人距离可考核还缺什么。"""
+    volunteer_id: int
+    batch_id: int
+    rule_version_id: Optional[int] = None
+    can_assess: bool
+    requirements: List[RequirementEvidenceStatus] = []
+    missing_requirements: List[str] = []
+    missing_count: int
+
+
+class EvidenceRevoke(BaseModel):
+    revoked_by: Optional[str] = None
+    revoke_reason: Optional[str] = None
+
+
+class EvidenceReviewHandle(BaseModel):
+    status: ReviewStatus
+    handled_by: Optional[str] = None
+    handle_comment: Optional[str] = None
+
+
+class EvidenceReview(BaseModel):
+    id: int
+    evidence_id: int
+    assessment_id: Optional[int] = None
+    certification_id: Optional[int] = None
+    reason: Optional[str] = None
+    status: ReviewStatus
+    created_at: datetime
+    handled_by: Optional[str] = None
+    handled_at: Optional[datetime] = None
+    handle_comment: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AssessmentEvidenceCheck(BaseModel):
+    """安排补考前的前置证据核对结果。"""
+    volunteer_id: int
+    topic_id: Optional[int] = None
+    training_batch_id: Optional[int] = None
+    prerequisites_complete: bool
+    checked_batches: List[int] = []
+    gaps: List[EligibilityGap] = []
+
+
 Volunteer.model_rebuild()
 VolunteerDetail.model_rebuild()
 Training.model_rebuild()
@@ -809,3 +1016,4 @@ TrainingBatchDetail.model_rebuild()
 SessionAttendanceWithVolunteer.model_rebuild()
 VolunteerDetailV2.model_rebuild()
 BenefitExchange.model_rebuild()
+CompetencyEvidenceDetail.model_rebuild()

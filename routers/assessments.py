@@ -4,6 +4,7 @@ from sqlalchemy import func
 from typing import List, Optional
 from database import get_db
 import models, schemas
+import evidence_service as evidence_svc
 from datetime import date, datetime
 
 router = APIRouter(prefix="/api/assessments", tags=["考核管理"])
@@ -35,6 +36,26 @@ def _issue_certification(db: Session, assessment: models.Assessment):
     db.add(cert)
     db.flush()
     return cert
+
+
+def _assert_prerequisites_complete(
+    db: Session, volunteer_id: int,
+    training_batch_id: Optional[int] = None, topic_id: Optional[int] = None
+):
+    """安排考核/补考前核对前置证据：必修要求证据不齐则禁止安排。"""
+    ok, _batch_ids, gaps = evidence_svc.check_prerequisites(
+        db, volunteer_id, training_batch_id, topic_id
+    )
+    if not ok:
+        missing = []
+        for g in gaps:
+            if not g.can_assess:
+                missing.extend(g.missing_requirements)
+        detail = "；".join(missing) if missing else "必修能力证据不完整"
+        raise HTTPException(
+            status_code=400,
+            detail=f"前置培训证据不齐全，不能安排考核（缺失：{detail}）"
+        )
 
 
 # ==================== 考核主题管理（具体路径前置） ====================
@@ -209,6 +230,20 @@ def create_assessment_v2(data: schemas.AssessmentCreateV2, db: Session = Depends
         topic = db.query(models.AssessmentTopic).filter(models.AssessmentTopic.id == data.topic_id).first()
         if not topic:
             raise HTTPException(status_code=404, detail="考核主题不存在")
+
+    # 安排考核前先把原课出勤物化为证据，再逐项核对必修能力前置证据是否齐全
+    if data.training_batch_id:
+        enrollment = db.query(models.Enrollment).filter(
+            models.Enrollment.volunteer_id == data.volunteer_id,
+            models.Enrollment.batch_id == data.training_batch_id,
+            models.Enrollment.status.in_([
+                models.EnrollmentStatus.ENROLLED, models.EnrollmentStatus.COMPLETED
+            ])
+        ).first()
+        if enrollment:
+            evidence_svc.build_attendance_evidences(db, enrollment.id)
+            evidence_svc.build_substitute_evidences(db, enrollment.id)
+    _assert_prerequisites_complete(db, data.volunteer_id, data.training_batch_id, data.topic_id)
     topic_name = None
     if data.topic_id:
         topic = db.query(models.AssessmentTopic).filter(models.AssessmentTopic.id == data.topic_id).first()
@@ -304,6 +339,9 @@ def submit_assessment_scores(assessment_id: int, data: schemas.AssessmentSubmitS
     volunteer = db.query(models.Volunteer).filter(models.Volunteer.id == assessment.volunteer_id).first()
     if volunteer:
         if assessment.result == models.AssessmentResult.PASSED:
+            # 补训考核通过先补全"补训考核"证据，再固化本次考核所依据的证据组合快照
+            evidence_svc.build_makeup_evidences_for_assessment(db, assessment)
+            evidence_svc.snapshot_assessment_basis(db, assessment)
             if volunteer.status == models.VolunteerStatus.PENDING_ASSESSMENT:
                 volunteer.status = models.VolunteerStatus.CERTIFIED
                 volunteer.certification_date = date.today()
@@ -324,6 +362,11 @@ def create_retake_assessment(assessment_id: int, new_date: Optional[date] = None
         raise HTTPException(status_code=404, detail="原考核记录不存在")
     if original.result != models.AssessmentResult.FAILED:
         raise HTTPException(status_code=400, detail="只有考核未通过才能安排补考")
+
+    # 安排补考前核对前置证据是否齐全
+    _assert_prerequisites_complete(
+        db, original.volunteer_id, original.training_batch_id, original.topic_id
+    )
 
     volunteer = db.query(models.Volunteer).filter(models.Volunteer.id == original.volunteer_id).first()
     if not volunteer:
@@ -350,8 +393,35 @@ def create_retake_assessment(assessment_id: int, new_date: Optional[date] = None
     return new_assessment
 
 
-# ==================== 讲解资格管理 ====================
+# ==================== 考核依据快照 ====================
 
+@router.get("/{assessment_id}/evidence-basis")
+def get_assessment_evidence_basis(assessment_id: int, db: Session = Depends(get_db)):
+    """查询某次考核形成时所依据的证据组合快照（历史依据，不因规则改版重算）。"""
+    assessment = db.query(models.Assessment).filter(models.Assessment.id == assessment_id).first()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="考核记录不存在")
+    rows = db.query(models.AssessmentEvidenceBasis).filter(
+        models.AssessmentEvidenceBasis.assessment_id == assessment_id
+    ).all()
+    return {
+        "assessment_id": assessment_id,
+        "basis_count": len(rows),
+        "basis": [
+            {
+                "basis_id": r.id,
+                "evidence_id": r.evidence_id,
+                "requirement_id": r.requirement_id,
+                "evidence_type": r.evidence_type.value,
+                "snapshot_at": r.snapshot_at,
+                "evidence_status": r.evidence.status.value if r.evidence else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+# ==================== 讲解资格管理 ====================
 @router.get("/volunteers/{volunteer_id}/certifications", response_model=List[schemas.VolunteerCertification])
 def list_volunteer_certifications(volunteer_id: int, db: Session = Depends(get_db)):
     volunteer = db.query(models.Volunteer).filter(models.Volunteer.id == volunteer_id).first()
@@ -475,6 +545,19 @@ def delete_assessment(assessment_id: int, db: Session = Depends(get_db)):
     assessment = db.query(models.Assessment).filter(models.Assessment.id == assessment_id).first()
     if not assessment:
         raise HTTPException(status_code=404, detail="考核记录不存在")
+    # 已形成证据依据或已发证的考核成绩不能直接删除，须走证据撤销→复核流程
+    basis_count = db.query(models.AssessmentEvidenceBasis).filter(
+        models.AssessmentEvidenceBasis.assessment_id == assessment_id
+    ).count()
+    cert = db.query(models.VolunteerCertification).filter(
+        models.VolunteerCertification.assessment_id == assessment_id,
+        models.VolunteerCertification.is_active == True
+    ).first()
+    if basis_count > 0 or cert:
+        raise HTTPException(
+            status_code=400,
+            detail="该考核已有证据依据或已发放证书，不能直接删除成绩；如证据有误请撤销对应证据，系统将把考核与证书转入复核"
+        )
     db.delete(assessment)
     db.commit()
     return {"message": "删除成功"}
