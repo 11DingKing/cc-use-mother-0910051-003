@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List, Optional
 from database import get_db
-import models, schemas
+import models, schemas, evidence_service
 from datetime import datetime
 
 router = APIRouter(prefix="/api/trainings", tags=["培训管理"])
@@ -121,7 +121,17 @@ def create_training_batch(batch: schemas.TrainingBatchCreate, db: Session = Depe
         topic = db.query(models.AssessmentTopic).filter(models.AssessmentTopic.id == batch.topic_id).first()
         if not topic:
             raise HTTPException(status_code=404, detail="考核主题不存在")
+    rule_version_id = batch.rule_version_id
+    if rule_version_id:
+        rv = db.query(models.RuleVersion).filter(models.RuleVersion.id == rule_version_id).first()
+        if not rv:
+            raise HTTPException(status_code=404, detail="规则版本不存在")
+    else:
+        # 期次默认绑定创建当时最新发布的规则版本；改版后新建期次才用新版本
+        rv = evidence_service.get_published_rule_version(db, batch.topic_id)
+        rule_version_id = rv.id if rv else None
     db_batch = models.TrainingBatch(**batch.model_dump())
+    db_batch.rule_version_id = rule_version_id
     db.add(db_batch)
     db.commit()
     db.refresh(db_batch)
@@ -260,9 +270,16 @@ def batch_enroll(data: schemas.BatchEnroll, db: Session = Depends(get_db)):
         enrollment = models.Enrollment(
             volunteer_id=vid,
             batch_id=data.batch_id,
-            status=models.EnrollmentStatus.ENROLLED
+            status=models.EnrollmentStatus.ENROLLED,
+            rule_version_id=batch.rule_version_id,
         )
         db.add(enrollment)
+        db.flush()
+        # 报名组合锁定期次规则版本；若期次未绑定则冻结报名当时最新发布版本/初始版本
+        if enrollment.rule_version_id is None:
+            version = evidence_service.effective_rule_version(db, enrollment)
+            if version is not None:
+                enrollment.rule_version_id = version.id
         enrolled.append(vid)
         current_count += 1
 

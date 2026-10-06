@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List, Optional
 from database import get_db
-import models, schemas
+import models, schemas, evidence_service
 from datetime import date, datetime
 
 router = APIRouter(prefix="/api/assessments", tags=["考核管理"])
@@ -33,6 +33,9 @@ def _issue_certification(db: Session, assessment: models.Assessment):
         is_active=True
     )
     db.add(cert)
+    db.flush()
+    # 发证瞬间冻结证据组合，作为历史依据；之后规则改版/证据撤销都不重算覆盖
+    evidence_service.freeze_certification_snapshot(db, cert, assessment)
     db.flush()
     return cert
 
@@ -209,6 +212,12 @@ def create_assessment_v2(data: schemas.AssessmentCreateV2, db: Session = Depends
         topic = db.query(models.AssessmentTopic).filter(models.AssessmentTopic.id == data.topic_id).first()
         if not topic:
             raise HTTPException(status_code=404, detail="考核主题不存在")
+
+    # 安排考核前核对前置培训证据是否齐全（原课出勤/批准替代/补训考核逐项满足）
+    bundle = evidence_service.assert_ready_for_assessment(
+        db, data.volunteer_id, data.training_batch_id, data.enrollment_id
+    )
+
     topic_name = None
     if data.topic_id:
         topic = db.query(models.AssessmentTopic).filter(models.AssessmentTopic.id == data.topic_id).first()
@@ -235,6 +244,9 @@ def create_assessment_v2(data: schemas.AssessmentCreateV2, db: Session = Depends
         comments=data.comments
     )
     db.add(db_assessment)
+    db.flush()
+    # 固化本次考核所依据的前置证据清单
+    evidence_service.attach_assessment_links(db, db_assessment, bundle)
     db.commit()
     db.refresh(db_assessment)
     return db_assessment
@@ -328,6 +340,12 @@ def create_retake_assessment(assessment_id: int, new_date: Optional[date] = None
     volunteer = db.query(models.Volunteer).filter(models.Volunteer.id == original.volunteer_id).first()
     if not volunteer:
         raise HTTPException(status_code=404, detail="志愿者不存在")
+
+    # 安排补考前同样核对前置培训证据是否齐全
+    bundle = evidence_service.assert_ready_for_assessment(
+        db, original.volunteer_id, original.training_batch_id
+    )
+
     if volunteer.status != models.VolunteerStatus.IN_TRAINING:
         volunteer.status = models.VolunteerStatus.IN_TRAINING
         db.flush()
@@ -345,6 +363,8 @@ def create_retake_assessment(assessment_id: int, new_date: Optional[date] = None
         comments=f"补考安排（原考核ID={original.id}）"
     )
     db.add(new_assessment)
+    db.flush()
+    evidence_service.attach_assessment_links(db, new_assessment, bundle)
     db.commit()
     db.refresh(new_assessment)
     return new_assessment
@@ -382,6 +402,11 @@ def issue_certification(cert: schemas.VolunteerCertificationCreate, db: Session 
     db_cert.issued_date = date.today()
     db_cert.is_active = True
     db.add(db_cert)
+    db.flush()
+    if cert.assessment_id:
+        source = db.query(models.Assessment).filter(models.Assessment.id == cert.assessment_id).first()
+        if source:
+            evidence_service.freeze_certification_snapshot(db, db_cert, source)
     db.commit()
     db.refresh(db_cert)
     return db_cert

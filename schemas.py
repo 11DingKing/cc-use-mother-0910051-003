@@ -3,7 +3,8 @@ from datetime import date, datetime
 from typing import Optional, List
 from models import (
     VolunteerStatus, AssessmentResult, TimeSlotStatus, TrainingBatchStatus, EnrollmentStatus,
-    PointsType, PointsSource, BenefitType, ExchangeStatus
+    PointsType, PointsSource, BenefitType, ExchangeStatus,
+    RequirementEvidenceType, LeaveStatus, EvidenceStatus, RuleVersionStatus, ReviewStatus
 )
 
 
@@ -181,6 +182,13 @@ class AssessmentUpdate(BaseModel):
 
 class Assessment(AssessmentBase):
     id: int
+    topic_id: Optional[int] = None
+    training_batch_id: Optional[int] = None
+    is_retake: bool = False
+    attempt_no: int = 1
+    review_status: ReviewStatus = ReviewStatus.NORMAL
+    review_reason: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
     created_at: datetime
 
     class Config:
@@ -317,7 +325,7 @@ class TrainingBatchBase(BaseModel):
 
 
 class TrainingBatchCreate(TrainingBatchBase):
-    pass
+    rule_version_id: Optional[int] = None
 
 
 class TrainingBatchUpdate(BaseModel):
@@ -334,6 +342,7 @@ class TrainingBatchUpdate(BaseModel):
 class TrainingBatch(TrainingBatchBase):
     id: int
     status: TrainingBatchStatus
+    rule_version_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     topic: Optional[AssessmentTopic] = None
@@ -370,6 +379,7 @@ class TrainingSessionUpdate(BaseModel):
 
 class TrainingSession(TrainingSessionBase):
     id: int
+    requirement_id: Optional[int] = None
     created_at: datetime
 
     class Config:
@@ -394,6 +404,7 @@ class EnrollmentCreate(EnrollmentBase):
 class Enrollment(EnrollmentBase):
     id: int
     status: EnrollmentStatus
+    rule_version_id: Optional[int] = None
     enrolled_at: datetime
     completed_at: Optional[datetime] = None
     volunteer: Optional["Volunteer"] = None
@@ -535,6 +546,7 @@ class AssessmentCreateV2(BaseModel):
     volunteer_id: int
     topic_id: Optional[int] = None
     training_batch_id: Optional[int] = None
+    enrollment_id: Optional[int] = None
     assessment_date: date
     examiner: Optional[str] = None
     comments: Optional[str] = None
@@ -563,6 +575,10 @@ class VolunteerCertification(VolunteerCertificationBase):
     certificate_no: Optional[str] = None
     issued_date: date
     is_active: bool
+    rule_version_id: Optional[int] = None
+    review_status: ReviewStatus = ReviewStatus.NORMAL
+    review_reason: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
     created_at: datetime
     topic: Optional[AssessmentTopic] = None
 
@@ -798,6 +814,225 @@ class BenefitStats(BaseModel):
     total_exchanged: int
     total_quantity: int
     total_points: int
+
+
+# ====================================================================
+# 证据组合（Evidence Bundle）相关模型
+# ====================================================================
+
+class RequiredCapabilityCreate(BaseModel):
+    code: str
+    name: str
+    description: Optional[str] = None
+    is_required: bool = True
+    sort_order: int = 0
+
+
+class RequiredCapability(RequiredCapabilityCreate):
+    id: int
+    rule_version_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RuleVersionCreate(BaseModel):
+    topic_id: Optional[int] = None
+    name: str
+    change_note: Optional[str] = None
+    capabilities: List[RequiredCapabilityCreate] = []
+    source_version_id: Optional[int] = None
+    publish: bool = False
+
+
+class RuleVersionPublish(BaseModel):
+    change_note: Optional[str] = None
+
+
+class RuleVersion(BaseModel):
+    id: int
+    topic_id: Optional[int] = None
+    version_no: int
+    name: str
+    status: RuleVersionStatus
+    change_note: Optional[str] = None
+    published_at: Optional[datetime] = None
+    created_at: datetime
+    capabilities: List[RequiredCapability] = []
+
+    class Config:
+        from_attributes = True
+
+
+class RuleVersionBrief(BaseModel):
+    id: int
+    version_no: int
+    name: str
+    status: RuleVersionStatus
+
+    class Config:
+        from_attributes = True
+
+
+class SessionRequirementLink(BaseModel):
+    session_id: int
+    requirement_id: int
+
+
+class LeaveRequestCreate(BaseModel):
+    enrollment_id: int
+    session_id: Optional[int] = None
+    reason_category: str
+    reason_detail: Optional[str] = None
+
+
+class LeaveDecision(BaseModel):
+    approved: bool
+    approver: Optional[str] = None
+    approval_comment: Optional[str] = None
+
+
+class LeaveRequest(BaseModel):
+    id: int
+    enrollment_id: int
+    session_id: Optional[int] = None
+    volunteer_id: int
+    reason_category: str
+    reason_detail: Optional[str] = None
+    status: LeaveStatus
+    approver: Optional[str] = None
+    approval_comment: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SubstituteApprovalCreate(BaseModel):
+    enrollment_id: int
+    requirement_id: int
+    substitute_type: RequirementEvidenceType
+    substitute_session_id: Optional[int] = None
+    leave_request_id: Optional[int] = None
+    approver: Optional[str] = None
+    comment: Optional[str] = None
+
+
+class SubstituteApproval(BaseModel):
+    id: int
+    enrollment_id: int
+    requirement_id: int
+    substitute_type: RequirementEvidenceType
+    substitute_session_id: Optional[int] = None
+    leave_request_id: Optional[int] = None
+    approver: Optional[str] = None
+    comment: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RequirementEvidenceBase(BaseModel):
+    enrollment_id: int
+    requirement_id: int
+
+
+class RequirementEvidenceCreate(RequirementEvidenceBase):
+    evidence_type: RequirementEvidenceType
+    attendance_id: Optional[int] = None
+    substitute_session_id: Optional[int] = None
+    assessment_id: Optional[int] = None
+    approval_id: Optional[int] = None
+    leave_request_id: Optional[int] = None
+    detail: Optional[str] = None
+
+
+class RequirementEvidence(BaseModel):
+    id: int
+    enrollment_id: int
+    requirement_id: int
+    volunteer_id: int
+    evidence_type: RequirementEvidenceType
+    status: EvidenceStatus
+    attendance_id: Optional[int] = None
+    substitute_session_id: Optional[int] = None
+    assessment_id: Optional[int] = None
+    approval_id: Optional[int] = None
+    leave_request_id: Optional[int] = None
+    detail: Optional[str] = None
+    void_reason: Optional[str] = None
+    voided_at: Optional[datetime] = None
+    created_at: datetime
+    requirement: Optional[RequiredCapability] = None
+    assessment: Optional["Assessment"] = None
+
+    class Config:
+        from_attributes = True
+
+
+class RequirementStatusItem(BaseModel):
+    """一项必修要求的核对结果"""
+    requirement_id: int
+    code: str
+    name: str
+    is_required: bool
+    satisfied: bool
+    evidence_id: Optional[int] = None
+    evidence_type: Optional[RequirementEvidenceType] = None
+    evidence_status: Optional[EvidenceStatus] = None
+    detail: Optional[str] = None
+    leave_status: Optional[LeaveStatus] = None
+
+
+class EvidenceBundle(BaseModel):
+    """以培训期次要求为基准的证据组合"""
+    enrollment_id: int
+    volunteer_id: int
+    volunteer_name: str
+    batch_id: int
+    batch_name: str
+    topic_id: Optional[int] = None
+    topic_name: Optional[str] = None
+    rule_version_id: Optional[int] = None
+    rule_version_no: Optional[int] = None
+    requirements: List[RequirementStatusItem] = []
+    required_total: int
+    satisfied_count: int
+    missing_count: int
+    ready_for_assessment: bool
+
+
+class VoidEvidenceRequest(BaseModel):
+    reason: str
+    operator: Optional[str] = None
+
+
+class EvidenceVoidResult(BaseModel):
+    evidence_id: int
+    status: EvidenceStatus
+    affected_assessments: List[int] = []
+    certifications_in_review: List[int] = []
+    message: str
+
+
+class CertificationEvidenceSnapshotOut(BaseModel):
+    id: int
+    certification_id: int
+    rule_version_id: Optional[int] = None
+    bundle_json: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReviewDecision(BaseModel):
+    maintain: bool = True
+    reason: Optional[str] = None
 
 
 Volunteer.model_rebuild()

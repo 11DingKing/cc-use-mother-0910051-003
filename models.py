@@ -40,6 +40,40 @@ class TimeSlotStatus(str, enum.Enum):
     CANCELLED = "已取消"
 
 
+class RequirementEvidenceType(str, enum.Enum):
+    """满足某项必修能力要求的证据类型"""
+    ORIGINAL_ATTENDANCE = "原课出勤"
+    SUBSTITUTE_COURSE = "替代课程"
+    MAKEUP_EXAM = "补训考核"
+
+
+class LeaveStatus(str, enum.Enum):
+    """缺课请假审批状态"""
+    PENDING = "待审批"
+    APPROVED = "已批准"
+    REJECTED = "已驳回"
+    CANCELLED = "已撤销"
+
+
+class EvidenceStatus(str, enum.Enum):
+    """证据本身的有效状态（撤销不等于删除）"""
+    VALID = "有效"
+    VOID = "已撤销"
+
+
+class RuleVersionStatus(str, enum.Enum):
+    DRAFT = "草稿"
+    PUBLISHED = "已发布"
+
+
+class ReviewStatus(str, enum.Enum):
+    """证据被撤销后，受影响的考核/证书进入的复核状态"""
+    NORMAL = "正常"
+    PENDING_REVIEW = "待复核"
+    CONFIRMED = "复核维持"
+    REVOKED = "复核撤销"
+
+
 class School(Base):
     __tablename__ = "schools"
 
@@ -150,12 +184,14 @@ class TrainingBatch(Base):
     min_attendance_rate = Column(Float, default=80.0)
     capacity = Column(Integer, default=30)
     status = Column(SAEnum(TrainingBatchStatus), default=TrainingBatchStatus.DRAFT)
+    rule_version_id = Column(Integer, ForeignKey("rule_versions.id"))
     start_date = Column(Date)
     end_date = Column(Date)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     topic = relationship("AssessmentTopic")
+    rule_version = relationship("RuleVersion", foreign_keys=[rule_version_id], back_populates="batches")
     sessions = relationship("TrainingSession", back_populates="batch", cascade="all, delete-orphan")
     enrollments = relationship("Enrollment", back_populates="batch", cascade="all, delete-orphan")
     assessments = relationship("Assessment", back_populates="training_batch")
@@ -174,10 +210,15 @@ class TrainingSession(Base):
     location = Column(String(100))
     trainer = Column(String(50))
     content = Column(Text)
+    requirement_id = Column(Integer, ForeignKey("required_capabilities.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
 
     batch = relationship("TrainingBatch", back_populates="sessions")
     attendances = relationship("SessionAttendance", back_populates="session", cascade="all, delete-orphan")
+    requirement = relationship(
+        "RequiredCapability", foreign_keys=[requirement_id],
+        back_populates="sessions", post_update=True
+    )
 
 
 class Enrollment(Base):
@@ -187,12 +228,14 @@ class Enrollment(Base):
     volunteer_id = Column(Integer, ForeignKey("volunteers.id"), nullable=False)
     batch_id = Column(Integer, ForeignKey("training_batches.id"), nullable=False)
     status = Column(SAEnum(EnrollmentStatus), default=EnrollmentStatus.ENROLLED)
+    rule_version_id = Column(Integer, ForeignKey("rule_versions.id"))
     enrolled_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime)
     notes = Column(Text)
 
     volunteer = relationship("Volunteer", back_populates="enrollments")
     batch = relationship("TrainingBatch", back_populates="enrollments")
+    rule_version = relationship("RuleVersion")
     attendances = relationship("SessionAttendance", back_populates="enrollment", cascade="all, delete-orphan")
 
 
@@ -268,11 +311,17 @@ class VolunteerCertification(Base):
     issued_date = Column(Date, default=date.today)
     expiry_date = Column(Date)
     is_active = Column(Boolean, default=True)
+    rule_version_id = Column(Integer, ForeignKey("rule_versions.id"))
+    review_status = Column(SAEnum(ReviewStatus), default=ReviewStatus.NORMAL)
+    review_reason = Column(Text)
+    reviewed_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     volunteer = relationship("Volunteer", back_populates="certifications")
     topic = relationship("AssessmentTopic", back_populates="certifications")
     assessment = relationship("Assessment")
+    rule_version = relationship("RuleVersion")
+    evidence_snapshot = relationship("CertificationEvidenceSnapshot", back_populates="certification", uselist=False, cascade="all, delete-orphan")
 
 
 class Training(Base):
@@ -322,6 +371,9 @@ class Assessment(Base):
     attempt_no = Column(Integer, default=1)
     examiner = Column(String(50))
     comments = Column(Text)
+    review_status = Column(SAEnum(ReviewStatus), default=ReviewStatus.NORMAL)
+    review_reason = Column(Text)
+    reviewed_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     volunteer = relationship("Volunteer", back_populates="assessments")
@@ -330,6 +382,7 @@ class Assessment(Base):
     parent_assessment = relationship("Assessment", remote_side=[id])
     scores = relationship("AssessmentScore", back_populates="assessment", cascade="all, delete-orphan")
     certification = relationship("VolunteerCertification", back_populates="assessment", uselist=False)
+    evidence_links = relationship("AssessmentEvidenceLink", back_populates="assessment", cascade="all, delete-orphan")
 
 
 class TimeSlot(Base):
@@ -437,3 +490,178 @@ class StarCertificate(Base):
 
     volunteer = relationship("Volunteer", back_populates="star_certificates")
     star_level = relationship("StarLevel")
+
+
+# ====================================================================
+# 以培训期次要求为基准的证据组合（Evidence Bundle）
+#
+# 规则版本（RuleVersion）→ 必修能力（RequiredCapability）
+#   每期培训在"发布当时"锁定一版规则；规则改版只产生新版本，
+#   不覆盖已形成的组合与已发证人员的历史依据。
+#
+# 缺课请假（LeaveRequest）：缺课原因 + 审批决定全程留痕。
+# 替代审批（SubstituteApproval）：批准"用替代课程/补训考核满足某要求"。
+# 要求依据（RequirementEvidence）：一项必修能力由且仅由一条有效依据满足
+#   （原课出勤 / 批准的替代课程 / 补训考核）。
+# 考核依据（AssessmentEvidenceLink）：安排/通过考核前核对的前置证据清单。
+# 发证快照（CertificationEvidenceSnapshot）：发证瞬间的依据冻结，
+#   之后规则或证据变化都不会重算覆盖。
+# 撤销/复核（EvidenceStatus / ReviewStatus）：撤销只置 VOID 并级联
+#   标记受影响考核、证书进入复核，从不物理删除既有成绩。
+# ====================================================================
+
+
+class RuleVersion(Base):
+    __tablename__ = "rule_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    topic_id = Column(Integer, ForeignKey("assessment_topics.id"))
+    version_no = Column(Integer, nullable=False, default=1)
+    name = Column(String(100), nullable=False)
+    status = Column(SAEnum(RuleVersionStatus), default=RuleVersionStatus.DRAFT)
+    change_note = Column(Text)
+    published_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    topic = relationship("AssessmentTopic")
+    capabilities = relationship(
+        "RequiredCapability", back_populates="rule_version",
+        cascade="all, delete-orphan"
+    )
+    batches = relationship(
+        "TrainingBatch", foreign_keys=[TrainingBatch.rule_version_id],
+        back_populates="rule_version"
+    )
+
+
+class RequiredCapability(Base):
+    """某版规则下的一项必修能力要求（通常对应一节必修课）"""
+    __tablename__ = "required_capabilities"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_version_id = Column(Integer, ForeignKey("rule_versions.id"), nullable=False)
+    code = Column(String(30), nullable=False)
+    name = Column(String(100), nullable=False)
+    description = Column(Text)
+    is_required = Column(Boolean, default=True)
+    sort_order = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    rule_version = relationship("RuleVersion", back_populates="capabilities")
+    sessions = relationship(
+        "TrainingSession", foreign_keys=[TrainingSession.requirement_id]
+    )
+    evidences = relationship(
+        "RequirementEvidence", back_populates="requirement",
+        cascade="all, delete-orphan"
+    )
+
+
+class LeaveRequest(Base):
+    """学员针对某节必修课的缺课请假：原因与审批决定留痕"""
+    __tablename__ = "leave_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    enrollment_id = Column(Integer, ForeignKey("enrollments.id"), nullable=False)
+    session_id = Column(Integer, ForeignKey("training_sessions.id"))
+    volunteer_id = Column(Integer, ForeignKey("volunteers.id"), nullable=False)
+    reason_category = Column(String(50), nullable=False)
+    reason_detail = Column(Text)
+    status = Column(SAEnum(LeaveStatus), default=LeaveStatus.PENDING)
+    approver = Column(String(50))
+    approval_comment = Column(Text)
+    approved_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    enrollment = relationship("Enrollment")
+    session = relationship("TrainingSession")
+    volunteer = relationship("Volunteer")
+
+
+class SubstituteApproval(Base):
+    """批准用替代课程或补训考核来满足某项必修要求的审批记录"""
+    __tablename__ = "substitute_approvals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    enrollment_id = Column(Integer, ForeignKey("enrollments.id"), nullable=False)
+    requirement_id = Column(Integer, ForeignKey("required_capabilities.id"), nullable=False)
+    substitute_type = Column(SAEnum(RequirementEvidenceType), nullable=False)
+    substitute_session_id = Column(Integer, ForeignKey("training_sessions.id"))
+    leave_request_id = Column(Integer, ForeignKey("leave_requests.id"))
+    approver = Column(String(50))
+    comment = Column(Text)
+    approved_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    enrollment = relationship("Enrollment")
+    requirement = relationship("RequiredCapability")
+    substitute_session = relationship("TrainingSession", foreign_keys=[substitute_session_id])
+    leave_request = relationship("LeaveRequest")
+
+
+class RequirementEvidence(Base):
+    """
+    一项必修能力的满足依据。evidence_type:
+      ORIGINAL_ATTENDANCE 原课出勤  → attendance_id
+      SUBSTITUTE_COURSE   替代课程  → substitute_session_id + approval_id
+      MAKEUP_EXAM         补训考核  → assessment_id + approval_id
+    """
+    __tablename__ = "requirement_evidences"
+
+    id = Column(Integer, primary_key=True, index=True)
+    enrollment_id = Column(Integer, ForeignKey("enrollments.id"), nullable=False)
+    requirement_id = Column(Integer, ForeignKey("required_capabilities.id"), nullable=False)
+    volunteer_id = Column(Integer, ForeignKey("volunteers.id"), nullable=False)
+    evidence_type = Column(SAEnum(RequirementEvidenceType), nullable=False)
+    status = Column(SAEnum(EvidenceStatus), default=EvidenceStatus.VALID)
+
+    attendance_id = Column(Integer, ForeignKey("session_attendances.id"))
+    substitute_session_id = Column(Integer, ForeignKey("training_sessions.id"))
+    assessment_id = Column(Integer, ForeignKey("assessments.id"))
+    approval_id = Column(Integer, ForeignKey("substitute_approvals.id"))
+    leave_request_id = Column(Integer, ForeignKey("leave_requests.id"))
+
+    detail = Column(Text)
+    void_reason = Column(Text)
+    voided_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    enrollment = relationship("Enrollment")
+    requirement = relationship("RequiredCapability", back_populates="evidences")
+    volunteer = relationship("Volunteer")
+    attendance = relationship("SessionAttendance")
+    substitute_session = relationship("TrainingSession", foreign_keys=[substitute_session_id])
+    assessment = relationship("Assessment")
+    approval = relationship("SubstituteApproval")
+    leave_request = relationship("LeaveRequest")
+
+
+class AssessmentEvidenceLink(Base):
+    """考核所依据的前置证据核对项：安排补考前逐项核对是否齐全"""
+    __tablename__ = "assessment_evidence_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    assessment_id = Column(Integer, ForeignKey("assessments.id"), nullable=False)
+    evidence_id = Column(Integer, ForeignKey("requirement_evidences.id"), nullable=False)
+    requirement_id = Column(Integer, ForeignKey("required_capabilities.id"), nullable=False)
+    satisfied = Column(Boolean, default=False)
+    note = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    assessment = relationship("Assessment", back_populates="evidence_links")
+    evidence = relationship("RequirementEvidence")
+    requirement = relationship("RequiredCapability")
+
+
+class CertificationEvidenceSnapshot(Base):
+    """发证瞬间冻结的证据组合：历史依据不随后续改版/撤销被重算覆盖"""
+    __tablename__ = "certification_evidence_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    certification_id = Column(Integer, ForeignKey("volunteer_certifications.id"), nullable=False, unique=True)
+    rule_version_id = Column(Integer, ForeignKey("rule_versions.id"))
+    bundle_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    certification = relationship("VolunteerCertification", back_populates="evidence_snapshot")
+    rule_version = relationship("RuleVersion")
